@@ -87,23 +87,22 @@ impl KeyPair {
 
         Ok(KeyPair { sk, pk })
     }
-}
 
-/// Holds only the Public Keys (h_i) of the tracing scheme.
-/// Used by Signers and Combiner to encrypt their status, but not decrypt.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct TracingKeys {
-    pub(crate) tks: Vec<PublicKey>,
-}
-
-impl TracingKeys {
-    /// Creates a TracingKeys struct from a list of full KeyPairs.
-    /// Extracts only the Public Key (pk) from each KeyPair.
-    pub fn set(kps: &[KeyPair]) -> Self {
-        let tks = kps.iter().map(|kp| kp.pk).collect();
-
-        TracingKeys { tks }
+    /// The public half of this key pair.
+    pub fn public_key(&self) -> PublicKey {
+        self.pk
     }
+}
+
+/// The generator `g` of the secp256k1 group, as a `PublicKey`.
+pub fn generator() -> PublicKey {
+    let secp = Secp256k1::new();
+    let one_sk = SecretKey::from_byte_array([
+        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 1,
+    ])
+    .unwrap();
+    PublicKey::from_secret_key(&secp, &one_sk)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -379,124 +378,51 @@ impl Secret {
     }
 }
 
-pub fn encrypt_bits(sec: &Secret, quo: &Quorum, kps: &TracingKeys) -> (PublicKey, Vec<PublicKey>) {
+/// Encrypts every signer's attendance bit under the shared tracer group key
+/// `pk_e`, each with its own fresh randomness `gamma_i` (Figure
+/// `elgamal-encryption`, specialized to `n_2 = 1` combiner: there is one
+/// ciphertext `v_i = (v_{0_i}, v_{1_i})` per signer instead of one per
+/// combiner).
+///
+/// `pk_e` is the group public key produced by the tracers' distributed key
+/// generation (`DistributedKeyGen`, Figure `dist-keygen`); decryption is a
+/// threshold operation among the tracers (see `protocol::dkg`), not
+/// performed by a single designated key as the earlier per-signer scheme
+/// did.
+pub fn encrypt_bits_threshold(
+    quo: &Quorum,
+    pk_e: &PublicKey,
+) -> (Vec<Secret>, Vec<ElGamalCiphertext>) {
     let secp = Secp256k1::new();
-    assert_eq!(
-        quo.participants.len(),
-        kps.tks.len(),
-        "Mismatch between quorum size and keys provided"
-    );
+    let g = generator();
 
-    // 1. Compute v0 = g^r
-    // Convert 'r' to SecretKey for operation
-    let r_sk = SecretKey::from_byte_array(sec.s.to_be_bytes()).unwrap();
-    let v0 = PublicKey::from_secret_key(&secp, &r_sk);
+    let mut gammas = Vec::with_capacity(quo.participants.len());
+    let mut ciphertexts = Vec::with_capacity(quo.participants.len());
 
-    // 2. Compute v_i for each participant
-    let mut v_vec = Vec::with_capacity(kps.tks.len());
+    for (_pk, bit) in &quo.participants {
+        let gamma = Secret::create();
 
-    for (i, (_pk, bit)) in quo.participants.iter().enumerate() {
-        // A. Compute shared secret term: S = pk_i^r (which is r * pk_i)
-        // We take the i-th public key
-        let pk_i = kps.tks[i]; // Or kps[i].public_key()
+        // v_{0_i} = g^{gamma_i}
+        let gamma_sk = SecretKey::from_byte_array(gamma.s.to_be_bytes()).unwrap();
+        let v0_i = PublicKey::from_secret_key(&secp, &gamma_sk);
 
-        let shared_secret = pk_i
-            .mul_tweak(&secp, &sec.s)
-            .expect("Failed to compute pk^r");
+        // Shared term: pk_e^{gamma_i}
+        let shared_secret = pk_e
+            .mul_tweak(&secp, &gamma.s)
+            .expect("Failed to compute pk_e^gamma_i");
 
-        // B. Compute v_i based on the bit
-        if *bit == 1 {
-            // Case 1: v_i = g^1 * pk^r = G + shared_secret
-
-            // We generate G by taking the public key of '1'
-            // (Alternatively, use the library's generator constant if available,
-            // but creating it from scalar 1 is generic and safe).
-            let one_sk = SecretKey::from_byte_array([
-                0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-                0, 0, 0, 1,
-            ])
-                .unwrap();
-            let G = PublicKey::from_secret_key(&secp, &one_sk);
-
-            // Add G to shared secret
-            let v_i = G.combine(&shared_secret).expect("Point addition failed");
-            v_vec.push(v_i);
+        // v_{1_i} = g^{b_i} * pk_e^{gamma_i}
+        let v1_i = if *bit == 1 {
+            g.combine(&shared_secret).expect("Point addition failed")
         } else {
-            // Case 0: v_i = g^0 * pk^r = Infinity + shared_secret = shared_secret
-            // We just push the shared secret directly.
-            v_vec.push(shared_secret);
-        }
+            shared_secret
+        };
+
+        gammas.push(gamma);
+        ciphertexts.push(ElGamalCiphertext { c0: v0_i, c1: v1_i });
     }
 
-    (v0, v_vec)
-}
-
-/// Decrypts the vector of commitments v_i to recover the original bits b_i.
-///
-/// Inputs:
-/// - v0: The ephemeral public key (g^r).
-/// - v_vec: The vector of encrypted bits (v_i).
-/// - tracing_keys: The Tracer's KeyPairs (containing private key tau_i).
-///
-/// Logic:
-/// 1. Compute shared secret S = v0^tau_i
-/// 2. If v_i == S, then g^b_i must be 1 (Identity), so b_i = 0.
-/// 3. If v_i == S + G, then g^b_i must be G, so b_i = 1.
-pub fn decrypt_bits(
-    v0: &PublicKey,
-    v_vec: &[PublicKey],
-    tracing_keys: &[KeyPair],
-) -> Result<Vec<u8>, String> {
-    let secp = Secp256k1::new();
-
-    if v_vec.len() != tracing_keys.len() {
-        return Err("Mismatch between ciphertext vector and tracing keys".to_string());
-    }
-
-    // Pre-compute Generator G (g^1)
-    let one_sk = SecretKey::from_byte_array([
-        0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
-        0, 1,
-    ])
-        .unwrap();
-    let G = PublicKey::from_secret_key(&secp, &one_sk);
-
-    let mut decrypted_bits = Vec::with_capacity(v_vec.len());
-
-    for (i, v_i) in v_vec.iter().enumerate() {
-        // 1. Get the private tracing key (tau_i)
-        let tau_i = tracing_keys[i].sk;
-
-        // 2. Compute shared secret term: S = v0^tau_i
-        let shared_secret = v0
-            .mul_tweak(&secp, &Scalar::from_be_bytes(tau_i.secret_bytes()).unwrap())
-            .map_err(|_| "Failed to compute v0^tau_i")?;
-
-        // 3. Check Case 0: Is v_i == S?
-        // If yes, then v_i = v0^tau_i * g^0, so bit is 0.
-        if *v_i == shared_secret {
-            decrypted_bits.push(0);
-        }
-        // 4. Check Case 1: Is v_i == S + G?
-        // If yes, then v_i = v0^tau_i * g^1, so bit is 1.
-        else {
-            let candidate_one = shared_secret
-                .combine(&G)
-                .map_err(|_| "Failed to combine shared_secret with G")?;
-
-            if *v_i == candidate_one {
-                decrypted_bits.push(1);
-            } else {
-                // If neither, the ciphertext is invalid or corrupted
-                return Err(format!(
-                    "Decryption failed at index {}: Value is neither 0 nor 1",
-                    i
-                ));
-            }
-        }
-    }
-
-    Ok(decrypted_bits)
+    (gammas, ciphertexts)
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -593,15 +519,25 @@ pub struct PK {
 }
 
 impl PK {
-    /// Sets up the Registry using a complete Ciphertext object.
-    pub fn set(kps: &[KeyPair], kp_cs: &KeyPair, kp_t: &KeyPair) -> Self {
+    /// Sets up the Registry. `pk_t` is the tracer group public key `pk_e`
+    /// produced by the tracers' distributed key generation - unlike the
+    /// signers and the combiner it has no single owning secret key, so it is
+    /// taken directly rather than derived from a `KeyPair`.
+    pub fn set(kps: &[KeyPair], kp_cs: &KeyPair, pk_t: PublicKey) -> Self {
         let signers_pks: Vec<PublicKey> = kps.iter().map(|kp| kp.pk).collect();
 
         PK {
             pk_i: signers_pks,
             pk_cs: kp_cs.pk,
-            pk_t: kp_t.pk,
+            pk_t,
         }
+    }
+
+    /// Builds the registry from public keys directly. Unlike `set`, this does
+    /// not require the caller to hold anyone's secret key - the Combiner, for
+    /// instance, only ever learns the signers' and its own public keys.
+    pub fn from_public_keys(pk_i: Vec<PublicKey>, pk_cs: PublicKey, pk_t: PublicKey) -> Self {
+        PK { pk_i, pk_cs, pk_t }
     }
 }
 
@@ -631,18 +567,18 @@ fn hash_to_scalar(tag: &[u8], data: &[u8]) -> Scalar {
 /// Absorbs the public parameters that every challenge in the protocol is bound to.
 /// Vectors are length-prefixed so that no two distinct parameter sets can produce
 /// the same byte stream.
-fn absorb_params(hasher: &mut Sha256, pk: &PK, tks: &TracingKeys) {
+///
+/// `pk.pk_t` carries the tracer group key `pk_e` produced by the tracers'
+/// distributed key generation, so it alone binds the challenge to the
+/// tracing key - there is no longer a separate per-signer tracing-key
+/// vector to absorb.
+fn absorb_params(hasher: &mut Sha256, pk: &PK) {
     hasher.update(&(pk.pk_i.len() as u64).to_be_bytes());
     for signer_pk in &pk.pk_i {
         hasher.update(&signer_pk.serialize());
     }
     hasher.update(&pk.pk_cs.serialize());
     hasher.update(&pk.pk_t.serialize());
-
-    hasher.update(&(tks.tks.len() as u64).to_be_bytes());
-    for h_i in &tks.tks {
-        hasher.update(&h_i.serialize());
-    }
 }
 
 /// The Schnorr challenge `c = H(params || T || R || m)`.
@@ -651,15 +587,9 @@ fn absorb_params(hasher: &mut Sha256, pk: &PK, tks: &TracingKeys) {
 /// combiner has produced any of the tracing material, so it deliberately covers
 /// just the public parameters, the encrypted threshold `T`, the aggregate nonce
 /// `R` and the message.
-pub fn compute_challenge_c(
-    pk: &PK,
-    tks: &TracingKeys,
-    T: &ElGamalCiphertext,
-    R: &PublicKey,
-    m: &[u8],
-) -> Scalar {
+pub fn compute_challenge_c(pk: &PK, T: &ElGamalCiphertext, R: &PublicKey, m: &[u8]) -> Scalar {
     let mut hasher = Sha256::new();
-    absorb_params(&mut hasher, pk, tks);
+    absorb_params(&mut hasher, pk);
     hasher.update(&T.c0.serialize());
     hasher.update(&T.c1.serialize());
     hasher.update(&R.serialize());
@@ -675,34 +605,33 @@ pub fn compute_challenge_c(
 /// transcript, which is what makes the Fiat-Shamir challenges below binding.
 #[derive(Clone, Copy)]
 pub struct Statement<'a> {
-    /// Signer / combiner / tracer public keys.
+    /// Signer / combiner / tracer public keys. `pk.pk_t` is the tracer group
+    /// key `pk_e`.
     pub pk: &'a PK,
-    /// Public tracing keys h_i.
-    pub tks: &'a TracingKeys,
     /// ElGamal encryption of the threshold t.
     pub T: &'a ElGamalCiphertext,
     /// Aggregate Schnorr nonce.
     pub R: &'a PublicKey,
     /// Signed message.
     pub m: &'a [u8],
-    /// ElGamal encryption of the aggregate response z, under pk_t.
+    /// ElGamal encryption of the aggregate response z, under pk_e.
     pub ct: &'a ElGamalCiphertext,
-    /// g^gamma, the ephemeral key of the encrypted quorum bits.
-    pub v0: &'a PublicKey,
-    /// Encrypted quorum bits v_i.
+    /// g^{gamma_i}, the per-signer ephemeral keys of the encrypted quorum bits.
+    pub v0: &'a [PublicKey],
+    /// Encrypted quorum bits v_{1_i}.
     pub v: &'a [PublicKey],
 }
 
 impl<'a> Statement<'a> {
     /// Re-derives the Schnorr challenge from the statement.
     pub fn c(&self) -> Scalar {
-        compute_challenge_c(self.pk, self.tks, self.T, self.R, self.m)
+        compute_challenge_c(self.pk, self.T, self.R, self.m)
     }
 
     /// Digest over the whole statement. Both `alpha` and `beta` start from it.
     fn digest(&self) -> [u8; 32] {
         let mut hasher = Sha256::new();
-        absorb_params(&mut hasher, self.pk, self.tks);
+        absorb_params(&mut hasher, self.pk);
         hasher.update(&self.T.c0.serialize());
         hasher.update(&self.T.c1.serialize());
         hasher.update(&self.R.serialize());
@@ -710,7 +639,10 @@ impl<'a> Statement<'a> {
         hasher.update(self.m);
         hasher.update(&self.ct.c0.serialize());
         hasher.update(&self.ct.c1.serialize());
-        hasher.update(&self.v0.serialize());
+        hasher.update(&(self.v0.len() as u64).to_be_bytes());
+        for v0_i in self.v0 {
+            hasher.update(&v0_i.serialize());
+        }
         hasher.update(&(self.v.len() as u64).to_be_bytes());
         for v_i in self.v {
             hasher.update(&v_i.serialize());
@@ -745,7 +677,10 @@ impl<'a> Statement<'a> {
         hasher.update(&proofs.S2b.serialize());
         hasher.update(&proofs.S3a.serialize());
         hasher.update(&proofs.S3b.serialize());
-        hasher.update(&proofs.S4a.serialize());
+        hasher.update(&(proofs.S4ai.len() as u64).to_be_bytes());
+        for s in &proofs.S4ai {
+            hasher.update(&s.serialize());
+        }
         hasher.update(&(proofs.S4bi.len() as u64).to_be_bytes());
         for s in &proofs.S4bi {
             hasher.update(&s.serialize());
@@ -762,21 +697,26 @@ pub struct Phis {
 
 impl Phis {
     /// Computes phi_i for every participant.
-    /// phi_i = alpha^i+1 * gamma * (1 - b_i)
-    pub fn set(alpha: &Scalar, gamma_scalar: &Secret, quo: &Quorum) -> Self {
+    /// phi_i = alpha^i+1 * gamma_i * (1 - b_i)
+    ///
+    /// Each signer now has its own encryption randomness `gamma_i` (Figure
+    /// `elgamal-encryption`), so unlike the earlier single-gamma scheme the
+    /// mask multiplies `alpha^i` by the *i*-th signer's own gamma.
+    pub fn set(alpha: &Scalar, gammas: &[Secret], quo: &Quorum) -> Self {
+        assert_eq!(
+            gammas.len(),
+            quo.participants.len(),
+            "One gamma_i is required per participant"
+        );
+
         let mut phi_vec = Vec::with_capacity(quo.participants.len());
 
         // We start with alpha^1 = alpha.
-        // In secp256k1, we can represent "1" as a byte array.
         let mut current_alpha_power_sk =
             SecretKey::from_byte_array(alpha.to_be_bytes()).expect("Invalid alpha scalar");
 
-        // We need gamma as a SecretKey to perform multiplication
-        let gamma =
-            SecretKey::from_byte_array(gamma_scalar.s.to_be_bytes()).expect("Invalid alpha scalar");
-
-        for (_pk, bit) in &quo.participants {
-            // Formula: phi_i = (alpha^i * gamma) * (1 - bit)
+        for ((_pk, bit), gamma_scalar) in quo.participants.iter().zip(gammas.iter()) {
+            // Formula: phi_i = (alpha^i * gamma_i) * (1 - bit)
 
             if *bit == 1 {
                 // If bit is 1, term is (1 - 1) = 0.
@@ -786,14 +726,15 @@ impl Phis {
                 });
             } else {
                 // If bit is 0, term is (1 - 0) = 1.
-                // Result is alpha^i * gamma.
+                // Result is alpha^i * gamma_i.
+                let gamma = SecretKey::from_byte_array(gamma_scalar.s.to_be_bytes())
+                    .expect("Invalid gamma scalar");
 
                 // We convert current_alpha_power to Scalar so we can use it to tweak gamma
                 let alpha_pow_scalar = Scalar::from_be_bytes(current_alpha_power_sk.secret_bytes())
                     .expect("Invalid alpha power scalar");
 
-                // Calculate: gamma * alpha^i
-                // We take 'gamma' and multiply it by the scalar 'alpha^i'
+                // Calculate: gamma_i * alpha^i
                 let phi_val = gamma
                     .mul_tweak(&alpha_pow_scalar)
                     .expect("Calculation of phi_i failed");
@@ -819,7 +760,7 @@ impl Phis {
 pub struct Witnesses {
     pub(crate) z: Scalar,
     pub(crate) rho: Scalar,
-    pub(crate) gamma: Scalar,
+    pub(crate) gamma_i: Vec<Scalar>,
     pub(crate) psi: Scalar,
     pub(crate) b_i: Vec<u8>,
     pub(crate) phi_i: Vec<Scalar>,
@@ -830,10 +771,12 @@ impl Witnesses {
     ///
     /// - quo: We extract bits b_i from quo.participants[i].1
     /// - phis: We extract the vector of scalars from phis.vec
+    /// - gammas: the per-signer encryption randomness produced by
+    ///   `encrypt_bits_threshold`
     pub fn set(
         z: Sign,
         rho: Secret,
-        gamma: Secret,
+        gammas: &[Secret],
         psi: Secret,
         quo: &Quorum,
         phis: &Phis,
@@ -846,10 +789,12 @@ impl Witnesses {
         // 2. Extract scalars phi_i from the Phis struct
         let phi_i = phis.phis.iter().map(|phi_| phi_.s).collect();
 
+        let gamma_i = gammas.iter().map(|g| g.s).collect();
+
         Witnesses {
             z: z.z,
             rho: rho.s,
-            gamma: gamma.s,
+            gamma_i,
             psi: psi.s,
             b_i,
             phi_i,
@@ -861,7 +806,7 @@ impl Witnesses {
 pub struct Blinds {
     pub(crate) k_z: Secret,
     pub(crate) k_rho: Secret,
-    pub(crate) k_gamma: Secret,
+    pub(crate) k_gamma_i: Vec<Secret>,
     pub(crate) k_psi: Secret,
     pub(crate) k_b_i: Vec<Secret>,
     pub(crate) k_phi_i: Vec<Secret>,
@@ -874,16 +819,19 @@ impl Blinds {
         // 1. Generate fixed scalars
         let k_z = Secret::create();
         let k_rho = Secret::create();
-        let k_gamma = Secret::create();
         let k_psi = Secret::create();
 
         // 2. Generate vectors of secrets
-        // We need 'n' secrets for the bits and 'n' secrets for the phi values.
+        // We need 'n' secrets for the bits, 'n' for the phi values, and 'n'
+        // for the per-signer gamma_i (Figure `elgamal-encryption` now draws
+        // one gamma per signer instead of one shared gamma).
 
+        let mut k_gamma_i = Vec::with_capacity(n);
         let mut k_b_i = Vec::with_capacity(n);
         let mut k_phi_i = Vec::with_capacity(n);
 
         for _ in 0..n {
+            k_gamma_i.push(Secret::create());
             k_b_i.push(Secret::create());
             k_phi_i.push(Secret::create());
         }
@@ -891,7 +839,7 @@ impl Blinds {
         Blinds {
             k_z,
             k_rho,
-            k_gamma,
+            k_gamma_i,
             k_psi,
             k_b_i,
             k_phi_i,
@@ -905,8 +853,8 @@ pub struct Hats {
     pub z_hat: Scalar,
     #[serde(with = "serde_scalar")]
     pub rho_hat: Scalar,
-    #[serde(with = "serde_scalar")]
-    pub gamma_hat: Scalar,
+    #[serde(with = "serde_scalar::vec")]
+    pub gamma_hat: Vec<Scalar>,
     #[serde(with = "serde_scalar")]
     pub psi_hat: Scalar,
     #[serde(with = "serde_scalar::vec")]
@@ -945,8 +893,18 @@ impl Hats {
         // --- Compute Fixed Hats ---
         let z_hat = compute_response(&witt.z, &bli.k_z.s);
         let rho_hat = compute_response(&witt.rho, &bli.k_rho.s);
-        let gamma_hat = compute_response(&witt.gamma, &bli.k_gamma.s);
         let psi_hat = compute_response(&witt.psi, &bli.k_psi.s);
+
+        // --- Compute (gamma_i)_hat ---
+        assert_eq!(
+            witt.gamma_i.len(),
+            bli.k_gamma_i.len(),
+            "Witnesses and Blinds must carry one gamma_i per participant"
+        );
+        let mut gamma_hat = Vec::with_capacity(witt.gamma_i.len());
+        for (i, gamma) in witt.gamma_i.iter().enumerate() {
+            gamma_hat.push(compute_response(gamma, &bli.k_gamma_i[i].s));
+        }
 
         // --- Compute (b_i)_hat ---
         let mut b_hat = Vec::with_capacity(witt.b_i.len());
@@ -983,7 +941,7 @@ pub struct Proofs {
     pub S2b: PublicKey,
     pub S3a: PublicKey,
     pub S3b: PublicKey,
-    pub S4a: PublicKey,
+    pub S4ai: Vec<PublicKey>,
     pub S4bi: Vec<PublicKey>,
     pub S4c: PublicKey,
 }
@@ -1110,34 +1068,36 @@ impl Proofs {
     }
 
     /// Computes Vector S4bi:
-    /// S4bi[j] = g^(k_b_i[j]) * h_i[j]^(k_gamma)
+    /// S4bi[i] = g^(k_b_i[i]) * pk_e^(k_gamma_i[i])
+    ///
+    /// Each signer now has its own gamma_i (and hence its own blind
+    /// k_gamma_i), and the per-signer tracing key h_i has been replaced by
+    /// the single shared tracer group key pk_e.
     pub(crate) fn compute_s4bi(
         k_b_i: &[Secret],
-        k_gamma: &Secret,
-        h_i: &TracingKeys,
+        k_gamma_i: &[Secret],
+        pk_e: &PublicKey,
     ) -> Vec<PublicKey> {
         let secp = Secp256k1::new();
         assert_eq!(
             k_b_i.len(),
-            h_i.tks.len(),
-            "Mismatch between secrets and h_i generators"
+            k_gamma_i.len(),
+            "Mismatch between k_b_i and k_gamma_i"
         );
 
         let mut s4bi_vec = Vec::with_capacity(k_b_i.len());
 
-        for (j, k_b) in k_b_i.iter().enumerate() {
+        for (k_b, k_gamma) in k_b_i.iter().zip(k_gamma_i.iter()) {
             // 1. Term 1: g^(k_b)
             // (Standard Generator G * k_b)
             let kb_sk =
                 SecretKey::from_byte_array(k_b.s.to_be_bytes()).expect("Invalid scalar in k_b_i");
             let term_1 = PublicKey::from_secret_key(&secp, &kb_sk);
 
-            // 2. Term 2: h_i[j]^(k_gamma)
-            // (Specific generator h_i * k_gamma)
-            let h_gen = h_i.tks[j];
-            let term_2 = h_gen
+            // 2. Term 2: pk_e^(k_gamma_i)
+            let term_2 = pk_e
                 .mul_tweak(&secp, &k_gamma.s)
-                .expect("Failed to compute h_i^k_gamma");
+                .expect("Failed to compute pk_e^k_gamma_i");
 
             // 3. Combine
             let result = term_1.combine(&term_2).expect("Point addition failed");
@@ -1148,12 +1108,15 @@ impl Proofs {
         s4bi_vec
     }
 
-    /// Computes S4c = Sum( (v_i ^ (alpha^(i+1) * k_b_i)) * (h_i ^ k_phi_i) )
+    /// Computes S4c = Sum( (v_i ^ (alpha^(i+1) * k_b_i)) * (pk_e ^ k_phi_i) )
+    ///
+    /// The per-signer tracing key h_i has been replaced by the single shared
+    /// tracer group key pk_e (Figure `sigma-protocol`, term `pk_e^{k_phi_i}`).
     pub(crate) fn compute_s4c(
         v_i: &[PublicKey],
         alpha: &Scalar,
         k_b_i: &[Secret],
-        h_i: &TracingKeys,
+        pk_e: &PublicKey,
         k_phi_i: &[Secret],
     ) -> PublicKey {
         let secp = Secp256k1::new();
@@ -1163,7 +1126,7 @@ impl Proofs {
             panic!("Vectors cannot be empty for S4c");
         }
         assert!(
-            k_b_i.len() == len && h_i.tks.len() == len && k_phi_i.len() == len,
+            k_b_i.len() == len && k_phi_i.len() == len,
             "Dimension mismatch in compute_s4c"
         );
 
@@ -1196,10 +1159,10 @@ impl Proofs {
                 v_i[index].mul_tweak(&secp, &coeff_a).unwrap()
             };
 
-            // 2. Part B: h_i ^ k_phi_i
+            // 2. Part B: pk_e ^ k_phi_i
             // FIX: Access the Scalar '.s' from the Secret directly
             let scalar_b = &k_phi_i[index].s;
-            let term_b = h_i.tks[index].mul_tweak(&secp, scalar_b).unwrap();
+            let term_b = pk_e.mul_tweak(&secp, scalar_b).unwrap();
 
             // 3. Combine
             term_a.combine(&term_b).expect("Point addition failed")
@@ -1220,10 +1183,14 @@ impl Proofs {
     }
 
     /// Main function to generate all proof components
+    ///
+    /// `pk_e` is the tracer group public key (produced by the tracers'
+    /// distributed key generation) that replaces the earlier per-signer
+    /// tracing keys h_i.
     pub fn compute_proofs(
         bli: &Blinds,
         pk: &PK,
-        h_i_vec: &TracingKeys,
+        pk_e: &PublicKey,
         v_i: &[PublicKey],
         c: &Scalar,
         alpha: &Scalar,
@@ -1255,17 +1222,17 @@ impl Proofs {
         let h = get_second_generator_h();
         let S3b = Proofs::compute_s3b(&bli.k_b_i, &bli.k_psi, &h);
 
-        // 7. Compute S4a
-        // S4a = g^k_gamma (Same logic as S2a, different secret)
-        let S4a = Proofs::compute_sa(&bli.k_gamma);
+        // 7. Compute S4ai (Vector)
+        // S4ai[i] = g^k_gamma_i[i] (Same logic as S2a, per-signer secret)
+        let S4ai: Vec<PublicKey> = bli.k_gamma_i.iter().map(Proofs::compute_sa).collect();
 
         // 8. Compute S4bi (Vector)
-        // S4bi = g^k_b_i * h_i^k_gamma
-        let S4bi = Proofs::compute_s4bi(&bli.k_b_i, &bli.k_gamma, &h_i_vec);
+        // S4bi = g^k_b_i * pk_e^k_gamma_i
+        let S4bi = Proofs::compute_s4bi(&bli.k_b_i, &bli.k_gamma_i, pk_e);
 
         // 9. Compute S4c
-        // S4c = Product( v_i ^ (alpha^(i+1)*k_b_i) * h_i^k_phi_i )
-        let S4c = Proofs::compute_s4c(v_i, alpha, &bli.k_b_i, &h_i_vec, &bli.k_phi_i);
+        // S4c = Product( v_i ^ (alpha^(i+1)*k_b_i) * pk_e^k_phi_i )
+        let S4c = Proofs::compute_s4c(v_i, alpha, &bli.k_b_i, pk_e, &bli.k_phi_i);
 
         Proofs {
             S1,
@@ -1273,7 +1240,7 @@ impl Proofs {
             S2b,
             S3a,
             S3b,
-            S4a,
+            S4ai,
             S4bi,
             S4c,
         }
@@ -1506,21 +1473,21 @@ impl Proofs {
         Ok(lhs == rhs)
     }
 
-    /// Verifies vector: S4b[i] * v[i]^beta == g^(b_hat[i]) * h[i]^gamma_hat
+    /// Verifies vector: S4b[i] * v[i]^beta == g^(b_hat[i]) * pk_e^gamma_hat[i]
     ///
-    /// ECC Translation: S4b[i] + (v[i] * beta) == (g * b_hat[i]) + (h[i] * gamma_hat)
+    /// ECC Translation: S4b[i] + (v[i] * beta) == (g * b_hat[i]) + (pk_e * gamma_hat[i])
     pub(crate) fn verify_s4bi(
         s4b: &[PublicKey],
         v: &[PublicKey],
-        h: &[PublicKey],
+        pk_e: &PublicKey,
         beta: &Scalar,
         b_hat: &[Scalar],
-        gamma_hat: &Scalar,
+        gamma_hat: &[Scalar],
     ) -> Result<bool, String> {
         let secp = Secp256k1::new();
         let len = s4b.len();
 
-        if v.len() != len || h.len() != len || b_hat.len() != len {
+        if v.len() != len || gamma_hat.len() != len || b_hat.len() != len {
             return Err("Vector dimension mismatch in verify_s4bi".to_string());
         }
 
@@ -1542,10 +1509,10 @@ impl Proofs {
             let b_sk = SecretKey::from_byte_array(b_hat[i].to_be_bytes()).unwrap();
             let term_g = PublicKey::from_secret_key(&secp, &b_sk);
 
-            // Term 2: h[i]^gamma_hat
-            let term_h = h[i]
-                .mul_tweak(&secp, gamma_hat)
-                .map_err(|_| format!("Failed to compute h[{}]^gamma_hat", i))?;
+            // Term 2: pk_e^gamma_hat[i]
+            let term_h = pk_e
+                .mul_tweak(&secp, &gamma_hat[i])
+                .map_err(|_| format!("Failed to compute pk_e^gamma_hat[{}]", i))?;
 
             // RHS: term_g + term_h
             let rhs = term_g
@@ -1561,12 +1528,37 @@ impl Proofs {
         Ok(true)
     }
 
+    /// Verifies vector: S4ai[i] * v0[i]^beta == g^gamma_hat[i]
+    ///
+    /// This is the per-signer analogue of the old single S4a check, now that
+    /// each signer draws its own gamma_i and hence its own ephemeral key
+    /// v0_i = g^gamma_i.
+    pub(crate) fn verify_s4ai(
+        s4ai: &[PublicKey],
+        v0: &[PublicKey],
+        beta: &Scalar,
+        gamma_hat: &[Scalar],
+    ) -> Result<bool, String> {
+        let len = s4ai.len();
+        if v0.len() != len || gamma_hat.len() != len {
+            return Err("Vector dimension mismatch in verify_s4ai".to_string());
+        }
+
+        for i in 0..len {
+            if !Proofs::verify_sa(&s4ai[i], &v0[i], beta, &gamma_hat[i])? {
+                return Ok(false);
+            }
+        }
+
+        Ok(true)
+    }
+
     /// Verifies S4c equation.
     /// Returns true if valid.
     pub(crate) fn verify_s4c(
         s4c: &PublicKey,
         v: &[PublicKey],
-        h: &[PublicKey],
+        pk_e: &PublicKey,
         beta: &Scalar,
         alpha: &Scalar,
         b_hat: &[Scalar],
@@ -1575,7 +1567,7 @@ impl Proofs {
         let secp = Secp256k1::new();
         let len = v.len();
 
-        if h.len() != len || b_hat.len() != len || phi_hat.len() != len {
+        if b_hat.len() != len || phi_hat.len() != len {
             return Err("Vector dimension mismatch in verify_s4c".to_string());
         }
 
@@ -1629,8 +1621,8 @@ impl Proofs {
                 .mul_tweak(&secp, &exp_a)
                 .map_err(|_| format!("Failed RHS term A at {}", i))?;
 
-            // Term B: h[i] ^ phi_hat
-            let term_b = h[i]
+            // Term B: pk_e ^ phi_hat
+            let term_b = pk_e
                 .mul_tweak(&secp, &phi_hat[i])
                 .map_err(|_| format!("Failed RHS term B at {}", i))?;
 
@@ -1661,13 +1653,15 @@ impl Proofs {
     /// never taken from the prover. `stmt.ct` / `stmt.R` must be the ones carried
     /// in `sigma`, otherwise the transcript will not match and verification fails.
     ///
-    /// Only public data is needed: the tracing keys are the public h_i, and the
-    /// tracer's public key comes from `stmt.pk.pk_t`. Anyone can run this.
+    /// Only public data is needed: the tracer group key comes from
+    /// `stmt.pk.pk_t` (produced by the tracers' distributed key generation).
+    /// Anyone can run this.
     pub fn verify(proof: &Proofs, sigma: &Sigma, stmt: &Statement) -> Result<bool, String> {
         let ts = stmt.T;
         let v0 = stmt.v0;
         let v = stmt.v;
         let pk = stmt.pk;
+        let pk_e = &pk.pk_t;
 
         // 0. Re-derive the Fiat-Shamir transcript and pin the prover to it.
         let c = stmt.c();
@@ -1749,20 +1743,19 @@ impl Proofs {
             return Err("S3b verification failed".to_string());
         }
 
-        // Check 6: S4a (Commitment to gamma randomness)
-        // Verifies: S4a * v0^beta == g^gamma_hat
-        let s4a_ok = Proofs::verify_sa(&proof.S4a, v0, &beta, &sigma.pi.hats.gamma_hat)?;
+        // Check 6: S4ai (Commitment to each signer's gamma_i randomness)
+        // Verifies: S4ai[i] * v0[i]^beta == g^gamma_hat[i]
+        let s4a_ok = Proofs::verify_s4ai(&proof.S4ai, v0, &beta, &sigma.pi.hats.gamma_hat)?;
         if !s4a_ok {
-            return Err("S4a verification failed".to_string());
+            return Err("S4ai verification failed".to_string());
         }
 
         // Check 7: S4bi (Individual Value Commitments)
-        // Verifies: S4bi[i] * v[i]^beta == g^b_hat[i] * h_i^gamma_hat
-        let h_pks: &[PublicKey] = &stmt.tks.tks;
+        // Verifies: S4bi[i] * v[i]^beta == g^b_hat[i] * pk_e^gamma_hat[i]
         let s4bi_ok = Proofs::verify_s4bi(
             &proof.S4bi,
             v,
-            h_pks,
+            pk_e,
             &beta,
             &sigma.pi.hats.b_hat,
             &sigma.pi.hats.gamma_hat,
@@ -1776,7 +1769,7 @@ impl Proofs {
         let s4c_ok = Proofs::verify_s4c(
             &proof.S4c,
             v,
-            h_pks,
+            pk_e,
             &beta,
             &alpha,
             &sigma.pi.hats.b_hat,
@@ -1817,7 +1810,7 @@ pub fn schnorr_signature(R: &PublicKey, quo: &Quorum, c: &Scalar) -> PublicKey {
     accumulator
 }
 
-// --- Add to src/taps.rs ---
+// --- Add to src/taps_tt ---
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Pi {
@@ -1872,7 +1865,9 @@ impl Sigma {
         // Hash the Hats (Responses)
         hasher.update(&pi.hats.z_hat.to_be_bytes());
         hasher.update(&pi.hats.rho_hat.to_be_bytes());
-        hasher.update(&pi.hats.gamma_hat.to_be_bytes());
+        for gamma_hat in &pi.hats.gamma_hat {
+            hasher.update(&gamma_hat.to_be_bytes());
+        }
         hasher.update(&pi.hats.psi_hat.to_be_bytes());
 
         for b_hat in &pi.hats.b_hat {
@@ -1937,7 +1932,9 @@ impl Sigma {
         // Hash Hats
         hasher.update(&sig.pi.hats.z_hat.to_be_bytes());
         hasher.update(&sig.pi.hats.rho_hat.to_be_bytes());
-        hasher.update(&sig.pi.hats.gamma_hat.to_be_bytes());
+        for gamma_hat in &sig.pi.hats.gamma_hat {
+            hasher.update(&gamma_hat.to_be_bytes());
+        }
         hasher.update(&sig.pi.hats.psi_hat.to_be_bytes());
 
         for b_hat in &sig.pi.hats.b_hat {
